@@ -1,0 +1,208 @@
+#!/usr/bin/env python
+import os
+import math
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
+import sys
+
+# Import project modules
+try:
+    from utils import Utils
+    from file_writer import FileWriter
+except ImportError:
+    print("Error: Could not find 'utils.py' or 'file_writer.py' in the current directory.")
+    sys.exit(1)
+
+# Configuration
+# ---------------------------------------------------------
+MIN_ZOOM = 15
+MAX_ZOOM = 15  # Increased to 15 for high detail
+PARALLEL_DOWNLOADS = 200
+
+EXTERNAL_DEST_DIR = r"F:\Nouveau dossier" # Path where tiles are moved to
+
+# Morocco Bounds (including Sahara) 
+# Based on user request: -18.52, 20.76, -1.26, 35.87
+MOROCCO_BOUNDS = {
+    "min_lon": -18.52368759914575, 
+    "max_lon": -1.2678153718748455, 
+    "min_lat": 20.760771761884637, 
+    "max_lat": 35.87213983821215
+}
+
+WORLD_BOUNDS = {
+    "min_lon": -180.0, 
+    "max_lon": 180.0, 
+    "min_lat": -85.0511, 
+    "max_lat": 85.0511
+}
+
+# Tile Source URL
+# Using ESRI World Imagery as it is the default high-quality source in the project.
+# You can change this to Google Maps or OSM if preferred.
+TILE_SOURCE = "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
+# TILE_SOURCE = "https://mt0.google.com/vt?lyrs=y&x={x}&y={y}&z={z}" # Google Hybrid (Satellite + Labels)
+# TILE_SOURCE = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"  # OSM
+
+# ---------------------------------------------------------
+
+lock = threading.Lock()
+
+def deg2num(lat_deg, lon_deg, zoom):
+    """Converts Lat/Lon to Tile X/Y coordinates"""
+    lat_rad = math.radians(lat_deg)
+    n = 2.0 ** zoom
+    xtile = int((lon_deg + 180.0) / 360.0 * n)
+    ytile = int((1.0 - math.log(math.tan(lat_rad) + (1 / math.cos(lat_rad))) / math.pi) / 2.0 * n)
+    
+    # Clamp to valid range
+    limit = int(n) - 1
+    xtile = max(0, min(limit, xtile))
+    ytile = max(0, min(limit, ytile))
+    return (xtile, ytile)
+
+def get_tiles(min_z, max_z):
+    """Generates the list of tiles to download based on zoom logic"""
+    all_tiles = []
+    for z in range(min_z, max_z + 1):
+        # Starting point is whole planet (Z < 10)
+        # At Z >= 10, only Morocco including its Sahara
+        bounds = WORLD_BOUNDS if z < 10 else MOROCCO_BOUNDS
+        
+        x_min, y_min = deg2num(bounds["max_lat"], bounds["min_lon"], z)
+        x_max, y_max = deg2num(bounds["min_lat"], bounds["max_lon"], z)
+        
+        # In slippy maps, y increases southward. 
+        # y_min (north) to y_max (south)
+        for x in range(min(x_min, x_max), max(x_min, x_max) + 1):
+            for y in range(min(y_min, y_max), max(y_min, y_max) + 1):
+                all_tiles.append((x, y, z))
+    return all_tiles
+
+def process_tile(tile):
+    """Downloads and saves a single tile"""
+    x, y, z = tile
+    
+    # Target paths
+    rel_path = os.path.join(str(z), str(x), f"{y}.png")
+    external_path = os.path.join(EXTERNAL_DEST_DIR, rel_path)
+    
+    # Check if tile already exists in the external drive
+    if os.path.isfile(external_path):
+        return "skipped"
+    
+    temp_file = Utils.randomString() + ".png"
+    temp_path = os.path.join("temp", temp_file)
+    
+    try:
+        code = Utils.downloadFile(TILE_SOURCE, temp_path, x, y, z)
+        if code == 200:
+            if os.path.isfile(temp_path):
+                # Download directly to the F: drive (external_path)
+                FileWriter.addTile(lock, external_path, temp_path, x, y, z, 1)
+                if os.path.exists(temp_path):
+                    # In case FileWriter didn't move it but copied it
+                    try: os.remove(temp_path)
+                    except: pass
+                return "downloaded"
+        return f"failed ({code})"
+    except Exception as e:
+        if os.path.exists(temp_path):
+            try: os.remove(temp_path)
+            except: pass
+        return f"error: {str(e)}"
+
+def print_progress(current, downloaded, skipped, failed, total, start_time):
+    """Displays a CLI progress bar with skip/download counts"""
+    percent = (current / total) * 100
+    elapsed = time.time() - start_time
+    rate = current / elapsed if elapsed > 0 else 0
+    remaining = (total - current) / rate if rate > 0 else 0
+    
+    bar_len = 30
+    filled = int(bar_len * current // total)
+    bar = '█' * filled + '-' * (bar_len - filled)
+    
+    sys.stdout.write(f"\r|{bar}| {percent:5.1f}% [{current}/{total}] D:{downloaded} S:{skipped} F:{failed} | {rate:5.1f} t/s | ETA: {int(remaining)}s")
+    sys.stdout.flush()
+
+def main():
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Download Morocco Map Tiles")
+    parser.add_argument("--min-zoom", type=int, default=15, help="Minimum zoom level (default: 0)")
+    parser.add_argument("--max-zoom", type=int, default=15, help="Maximum zoom level (default: 15)")
+    args = parser.parse_args()
+
+    min_zoom = args.min_zoom
+    max_zoom = args.max_zoom
+    
+    print(f"==================================================")
+    print(f"  MOROCCO MAP TILES GENERATOR (INCL. SAHARA)     ")
+    print(f"==================================================")
+    print(f"Zoom Range:    {min_zoom} to {max_zoom}")
+    print(f"Coverage:      Z0-9: World | Z10+: Morocco Only")
+    print(f"Parallelism:   {PARALLEL_DOWNLOADS} threads")
+    print(f"Output:        {EXTERNAL_DEST_DIR}")
+    print(f"Source:        {TILE_SOURCE}")
+    print(f"--------------------------------------------------")
+    
+    tiles = get_tiles(min_zoom, max_zoom)
+    total = len(tiles)
+    print(f"Total tiles calculated: {total}")
+    
+    if total == 0:
+        print("No tiles to download. Check your zoom/bounds.")
+        return
+
+    # Create directories
+    os.makedirs("temp", exist_ok=True)
+    os.makedirs(EXTERNAL_DEST_DIR, exist_ok=True)
+
+    # Write metadata
+    bounds_arr = [MOROCCO_BOUNDS["min_lon"], MOROCCO_BOUNDS["min_lat"], MOROCCO_BOUNDS["max_lon"], MOROCCO_BOUNDS["max_lat"]]
+    center_arr = [(MOROCCO_BOUNDS["min_lon"] + MOROCCO_BOUNDS["max_lon"])/2, (MOROCCO_BOUNDS["min_lat"] + MOROCCO_BOUNDS["max_lat"])/2, max_zoom]
+    FileWriter.addMetadata(lock, EXTERNAL_DEST_DIR, "metadata.json", "Morocco Tiles", "Morocco with Sahara", "png", bounds_arr, center_arr, min_zoom, max_zoom)
+
+    start_time = time.time()
+    processed = 0
+    downloaded = 0
+    skipped = 0
+    failed = 0
+    
+    # Use ThreadPoolExecutor for high parallelism
+    with ThreadPoolExecutor(max_workers=PARALLEL_DOWNLOADS) as executor:
+        futures = {executor.submit(process_tile, tile): tile for tile in tiles}
+        
+        for future in as_completed(futures):
+            processed += 1
+            result = future.result()
+            
+            if result == "downloaded":
+                downloaded += 1
+            elif result == "skipped":
+                skipped += 1
+            else:
+                failed += 1
+                
+            if processed % 10 == 0 or processed == total:
+                print_progress(processed, downloaded, skipped, failed, total, start_time)
+                
+    print(f"\n\nDownload complete!")
+    print(f"- Total processed: {processed}")
+    print(f"- Newly downloaded: {downloaded}")
+    print(f"- Skipped (already exist): {skipped}")
+    print(f"- Failed: {failed}")
+    print(f"All tiles are in '{EXTERNAL_DEST_DIR}'.")
+
+if __name__ == "__main__":
+    # Ensure necessary folders exist
+    os.makedirs("temp", exist_ok=True)
+    os.makedirs(EXTERNAL_DEST_DIR, exist_ok=True)
+    
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n\nOperation cancelled by user.")
+        sys.exit(0)
